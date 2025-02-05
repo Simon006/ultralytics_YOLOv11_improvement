@@ -57,6 +57,10 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    C3k2_PPA,
+    PPA,
+    AKConv,
+    C3k2_AKConv
 )
 from .conv import (
     CBAM,
@@ -160,4 +164,8 @@ __all__ = (
     "PSA",
     "TorchVision",
     "Index",
+    "C3k2_PPA",
+    "PPA",
+    "AKConv",
+    "C3k2_AKConv"
 )

@@ -53,6 +53,188 @@ __all__ = (
 )
 
 
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SpatialAttentionModule(nn.Module):
+    def __init__(self):
+        super(SpatialAttentionModule, self).__init__()
+        self.conv2d = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avgout = torch.mean(x, dim=1, keepdim=True)
+        maxout, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avgout, maxout], dim=1)
+        out = self.sigmoid(self.conv2d(out))
+        return out * x
+
+
+class PPA(nn.Module):
+    def __init__(self, in_features, filters) -> None:
+        super().__init__()
+
+        self.skip = conv_block(in_features=in_features,
+                               out_features=filters,
+                               kernel_size=(1, 1),
+                               padding=(0, 0),
+                               norm_type='bn',
+                               activation=False)
+        self.c1 = conv_block(in_features=in_features,
+                             out_features=filters,
+                             kernel_size=(3, 3),
+                             padding=(1, 1),
+                             norm_type='bn',
+                             activation=True)
+        self.c2 = conv_block(in_features=filters,
+                             out_features=filters,
+                             kernel_size=(3, 3),
+                             padding=(1, 1),
+                             norm_type='bn',
+                             activation=True)
+        self.c3 = conv_block(in_features=filters,
+                             out_features=filters,
+                             kernel_size=(3, 3),
+                             padding=(1, 1),
+                             norm_type='bn',
+                             activation=True)
+        self.sa = SpatialAttentionModule()
+        self.cn = ECA(filters)
+        self.lga2 = LocalGlobalAttention(filters, 2)
+        self.lga4 = LocalGlobalAttention(filters, 4)
+
+        self.bn1 = nn.BatchNorm2d(filters)
+        self.drop = nn.Dropout2d(0.1)
+        self.relu = nn.ReLU()
+
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        x_skip = self.skip(x)
+        x_lga2 = self.lga2(x_skip)
+        x_lga4 = self.lga4(x_skip)
+        x1 = self.c1(x)
+        x2 = self.c2(x1)
+        x3 = self.c3(x2)
+        x = x1 + x2 + x3 + x_skip + x_lga2 + x_lga4
+        x = self.cn(x)
+        x = self.sa(x)
+        x = self.drop(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        return x
+
+
+class LocalGlobalAttention(nn.Module):
+    def __init__(self, output_dim, patch_size):
+        super().__init__()
+        self.output_dim = output_dim
+        self.patch_size = patch_size
+        self.mlp1 = nn.Linear(patch_size * patch_size, output_dim // 2)
+        self.norm = nn.LayerNorm(output_dim // 2)
+        self.mlp2 = nn.Linear(output_dim // 2, output_dim)
+        self.conv = nn.Conv2d(output_dim, output_dim, kernel_size=1)
+        self.prompt = torch.nn.parameter.Parameter(torch.randn(output_dim, requires_grad=True))
+        self.top_down_transform = torch.nn.parameter.Parameter(torch.eye(output_dim), requires_grad=True)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)
+        B, H, W, C = x.shape
+        P = self.patch_size
+
+        # Local branch
+        local_patches = x.unfold(1, P, P).unfold(2, P, P)  # (B, H/P, W/P, P, P, C)
+        local_patches = local_patches.reshape(B, -1, P * P, C)  # (B, H/P*W/P, P*P, C)
+        local_patches = local_patches.mean(dim=-1)  # (B, H/P*W/P, P*P)
+
+        local_patches = self.mlp1(local_patches)  # (B, H/P*W/P, input_dim // 2)
+        local_patches = self.norm(local_patches)  # (B, H/P*W/P, input_dim // 2)
+        local_patches = self.mlp2(local_patches)  # (B, H/P*W/P, output_dim)
+
+        local_attention = F.softmax(local_patches, dim=-1)  # (B, H/P*W/P, output_dim)
+        local_out = local_patches * local_attention  # (B, H/P*W/P, output_dim)
+
+        cos_sim = F.normalize(local_out, dim=-1) @ F.normalize(self.prompt[None, ..., None], dim=1)  # B, N, 1
+        mask = cos_sim.clamp(0, 1)
+        local_out = local_out * mask
+        local_out = local_out @ self.top_down_transform
+
+        # Restore shapes
+        local_out = local_out.reshape(B, H // P, W // P, self.output_dim)  # (B, H/P, W/P, output_dim)
+        local_out = local_out.permute(0, 3, 1, 2)
+        local_out = F.interpolate(local_out, size=(H, W), mode='bilinear', align_corners=False)
+        output = self.conv(local_out)
+
+        return output
+
+
+class ECA(nn.Module):
+    def __init__(self, in_channel, gamma=2, b=1):
+        super(ECA, self).__init__()
+        k = int(abs((math.log(in_channel, 2) + b) / gamma))
+        kernel_size = k if k % 2 else k + 1
+        padding = kernel_size // 2
+        self.pool = nn.AdaptiveAvgPool2d(output_size=1)
+        self.conv = nn.Sequential(
+            nn.Conv1d(in_channels=1, out_channels=1, kernel_size=kernel_size, padding=padding, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        out = self.pool(x)
+        out = out.view(x.size(0), 1, x.size(1))
+        out = self.conv(out)
+        out = out.view(x.size(0), x.size(1), 1, 1)
+        return out * x
+
+
+class conv_block(nn.Module):
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 kernel_size=(3, 3),
+                 stride=(1, 1),
+                 padding=(1, 1),
+                 dilation=(1, 1),
+                 norm_type='bn',
+                 activation=True,
+                 use_bias=True,
+                 groups=1
+                 ):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels=in_features,
+                              out_channels=out_features,
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=padding,
+                              dilation=dilation,
+                              bias=use_bias,
+                              groups=groups)
+
+        self.norm_type = norm_type
+        self.act = activation
+
+        if self.norm_type == 'gn':
+            self.norm = nn.GroupNorm(32 if out_features >= 32 else out_features, out_features)
+        if self.norm_type == 'bn':
+            self.norm = nn.BatchNorm2d(out_features)
+        if self.act:
+            # self.relu = nn.GELU()
+            self.relu = nn.ReLU(inplace=False)
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.norm_type is not None:
+            x = self.norm(x)
+        if self.act:
+            x = self.relu(x)
+        return x
+
+
+
 class DFL(nn.Module):
     """
     Integral module of Distribution Focal Loss (DFL).
@@ -407,6 +589,210 @@ class ResNetLayer(nn.Module):
     def forward(self, x):
         """Forward pass through the ResNet layer."""
         return self.layer(x)
+
+
+class C2f_PPA(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
+        expansion.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.att = PPA(c2, c2)
+
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.att(self.cv2(torch.cat(y, 1)))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.att(self.cv2(torch.cat(y, 1)))
+
+
+class C3k2_PPA(C2f_PPA):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )
+
+from einops import rearrange
+ 
+class AKConv(nn.Module):
+    def __init__(self, inc, outc, num_param=5, stride=1):
+        super(AKConv, self).__init__()
+        self.num_param = num_param
+        self.stride = stride
+        self.conv = Conv(inc, outc, k=(num_param, 1), s=(num_param, 1) )
+        self.p_conv = nn.Conv2d(inc, 2 * num_param, kernel_size=3, padding=1, stride=stride)
+        nn.init.constant_(self.p_conv.weight, 0)
+        self.p_conv.register_full_backward_hook(self._set_lr)
+ 
+    @staticmethod
+    def _set_lr(module, grad_input, grad_output):
+        grad_input = (grad_input[i] * 0.1 for i in range(len(grad_input)))
+        grad_output = (grad_output[i] * 0.1 for i in range(len(grad_output)))
+ 
+    def forward(self, x):
+        # N is num_param.
+        offset = self.p_conv(x)
+        dtype = offset.data.type()
+        N = offset.size(1) // 2
+        # (b, 2N, h, w)
+        p = self._get_p(offset, dtype)
+ 
+        # (b, h, w, 2N)
+        p = p.contiguous().permute(0, 2, 3, 1)
+        q_lt = p.detach().floor()
+        q_rb = q_lt + 1
+ 
+        q_lt = torch.cat([torch.clamp(q_lt[..., :N], 0, x.size(2) - 1), torch.clamp(q_lt[..., N:], 0, x.size(3) - 1)],
+                         dim=-1).long()
+        q_rb = torch.cat([torch.clamp(q_rb[..., :N], 0, x.size(2) - 1), torch.clamp(q_rb[..., N:], 0, x.size(3) - 1)],
+                         dim=-1).long()
+        q_lb = torch.cat([q_lt[..., :N], q_rb[..., N:]], dim=-1)
+        q_rt = torch.cat([q_rb[..., :N], q_lt[..., N:]], dim=-1)
+ 
+        # clip p
+        p = torch.cat([torch.clamp(p[..., :N], 0, x.size(2) - 1), torch.clamp(p[..., N:], 0, x.size(3) - 1)], dim=-1)
+ 
+        # bilinear kernel (b, h, w, N)
+        g_lt = (1 + (q_lt[..., :N].type_as(p) - p[..., :N])) * (1 + (q_lt[..., N:].type_as(p) - p[..., N:]))
+        g_rb = (1 - (q_rb[..., :N].type_as(p) - p[..., :N])) * (1 - (q_rb[..., N:].type_as(p) - p[..., N:]))
+        g_lb = (1 + (q_lb[..., :N].type_as(p) - p[..., :N])) * (1 - (q_lb[..., N:].type_as(p) - p[..., N:]))
+        g_rt = (1 - (q_rt[..., :N].type_as(p) - p[..., :N])) * (1 + (q_rt[..., N:].type_as(p) - p[..., N:]))
+ 
+        # resampling the features based on the modified coordinates.
+        x_q_lt = self._get_x_q(x, q_lt, N)
+        x_q_rb = self._get_x_q(x, q_rb, N)
+        x_q_lb = self._get_x_q(x, q_lb, N)
+        x_q_rt = self._get_x_q(x, q_rt, N)
+ 
+        # bilinear
+        x_offset = g_lt.unsqueeze(dim=1) * x_q_lt + \
+                   g_rb.unsqueeze(dim=1) * x_q_rb + \
+                   g_lb.unsqueeze(dim=1) * x_q_lb + \
+                   g_rt.unsqueeze(dim=1) * x_q_rt
+ 
+        x_offset = self._reshape_x_offset(x_offset, self.num_param)
+        out = self.conv(x_offset)
+ 
+        return out
+ 
+    # generating the inital sampled shapes for the AKConv with different sizes.
+    def _get_p_n(self, N, dtype):
+        base_int = round(math.sqrt(self.num_param))
+        row_number = self.num_param // base_int
+        mod_number = self.num_param % base_int
+        p_n_x, p_n_y = torch.meshgrid(
+            torch.arange(0, row_number),
+            torch.arange(0, base_int), indexing='xy')
+        p_n_x = torch.flatten(p_n_x)
+        p_n_y = torch.flatten(p_n_y)
+        if mod_number > 0:
+            mod_p_n_x, mod_p_n_y = torch.meshgrid(
+                torch.arange(row_number, row_number + 1),
+                torch.arange(0, mod_number), indexing='xy')
+ 
+            mod_p_n_x = torch.flatten(mod_p_n_x)
+            mod_p_n_y = torch.flatten(mod_p_n_y)
+            p_n_x, p_n_y = torch.cat((p_n_x, mod_p_n_x)), torch.cat((p_n_y, mod_p_n_y))
+        p_n = torch.cat([p_n_x, p_n_y], 0)
+        p_n = p_n.view(1, 2 * N, 1, 1).type(dtype)
+        return p_n
+ 
+    # no zero-padding
+    def _get_p_0(self, h, w, N, dtype):
+        p_0_x, p_0_y = torch.meshgrid(
+            torch.arange(0, h * self.stride, self.stride),
+            torch.arange(0, w * self.stride, self.stride), indexing='xy')
+ 
+        p_0_x = torch.flatten(p_0_x).view(1, 1, h, w).repeat(1, N, 1, 1)
+        p_0_y = torch.flatten(p_0_y).view(1, 1, h, w).repeat(1, N, 1, 1)
+        p_0 = torch.cat([p_0_x, p_0_y], 1).type(dtype)
+ 
+        return p_0
+ 
+    def _get_p(self, offset, dtype):
+        N, h, w = offset.size(1) // 2, offset.size(2), offset.size(3)
+ 
+        # (1, 2N, 1, 1)
+        p_n = self._get_p_n(N, dtype)
+        # (1, 2N, h, w)
+        p_0 = self._get_p_0(h, w, N, dtype)
+        p = p_0 + p_n + offset
+        return p
+ 
+    def _get_x_q(self, x, q, N):
+        b, h, w, _ = q.size()
+        padded_w = x.size(3)
+        c = x.size(1)
+        # (b, c, h*w)
+        x = x.contiguous().view(b, c, -1)
+ 
+        # (b, h, w, N)
+        index = q[..., :N] * padded_w + q[..., N:]  # offset_x*w + offset_y
+        # (b, c, h*w*N)
+        index = index.contiguous().unsqueeze(dim=1).expand(-1, c, -1, -1, -1).contiguous().view(b, c, -1)
+ 
+        x_offset = x.gather(dim=-1, index=index).contiguous().view(b, c, h, w, N)
+ 
+        return x_offset
+ 
+    #  Stacking resampled features in the row direction.
+    @staticmethod
+    def _reshape_x_offset(x_offset, num_param):
+        b, c, h, w, n = x_offset.size()
+        x_offset = rearrange(x_offset, 'b c h w n -> b c (h n) w')
+        return x_offset
+    
+class C2f_AKConv(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
+        expansion.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.cv3 = AKConv(c2, c2)
+
+    def forward(self, x):
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv3(self.cv2(torch.cat(y, 1)))
+
+    def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv3(self.cv2(torch.cat(y, 1)))
+
+class C3k2_AKConv(C2f_AKConv):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        """Initializes the C3k2 module, a faster CSP Bottleneck with 2 convolutions and optional C3k blocks."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )
 
 
 class MaxSigmoidAttnBlock(nn.Module):
